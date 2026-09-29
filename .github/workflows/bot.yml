@@ -1,1 +1,7 @@
+name: Modern City Bot
 
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
