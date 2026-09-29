@@ -1,374 +1,67 @@
 import os
 import re
 import sqlite3
+import time
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import discord
-from discord.ext import commands
 from discord import app_commands
+from discord.ext import commands, tasks
 
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ============================================================
+# MODERN CITY RP BOT
+# PART 1/3
+# ============================================================
+
+TOKEN = os.getenv("BOT_TOKEN")
+
+# ---------------- SERVER ----------------
 
 GUILD_ID = 1552902541061394432
+
+# ---------------- ROLES ----------------
+
 CITIZEN_ROLE_ID = 1552903102204747856
 MASTER_ROLE_ID = 1552903005500866650
 
-TOKEN = os.getenv("BOT_TOKEN")
+# ---------------- CHANNELS ----------------
+
+ORG_PANEL_CHANNEL_ID = 1552903355339243520
+APPLICATION_CATEGORY_ID = 1553784383989743616
+LOG_CHANNEL_ID = 1553365117750485032
+
+# ---------------- DATABASE ----------------
 
 DB_FILE = "modern_city.db"
 
 
-# =========================================================
-# ADVANCED ANTI-LINK
-# =========================================================
-
-URL_PATTERN = re.compile(
-    r"""(?ix)
-    (?:
-        https?://[^\s<>()]+
-        |
-        www\.[^\s<>()]+
-        |
-        discord\.gg/[^\s<>()]+
-        |
-        discord\.com/invite/[^\s<>()]+
-        |
-        discordapp\.com/invite/[^\s<>()]+
-        |
-        (?<![@\w.-])
-        (?:[a-z0-9-]+\.)+
-        (?:
-            com|net|org|gg|io|in|co|xyz|me|dev|app|
-            info|biz|site|online|store|tech|pro|live
-        )
-        (?:[/?#][^\s<>()]*)?
-    )
-    """
-)
-
-
-# =========================================================
-# INTENTS
-# =========================================================
-
-intents = discord.Intents.default()
-
-intents.members = True
-intents.presences = True
-intents.message_content = True
-
-
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
-
-
-# =========================================================
-# DATABASE
-# =========================================================
-
-db = sqlite3.connect(
-    DB_FILE,
-    check_same_thread=False
-)
-
-db.row_factory = sqlite3.Row
-
-
-def init_database():
-
-    cursor = db.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS warnings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            issuer_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS verification (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            organization TEXT NOT NULL,
-            character_name TEXT NOT NULL,
-            character_age TEXT NOT NULL,
-            experience TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS activity (
-            guild_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            active_seconds REAL DEFAULT 0,
-            idle_seconds REAL DEFAULT 0,
-            current_status TEXT DEFAULT 'offline',
-            last_change TEXT NOT NULL,
-            idle_since TEXT,
-            PRIMARY KEY(guild_id, user_id)
-        )
-    """)
-
-    db.commit()
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def iso_time(dt):
-    return dt.astimezone(timezone.utc).isoformat()
-
-
-def parse_time(value):
-    return datetime.fromisoformat(value)
-
-
-def format_duration(seconds):
-
-    seconds = int(max(0, seconds))
-
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes, seconds = divmod(seconds, 60)
-
-    result = []
-
-    if days:
-        result.append(f"{days}d")
-
-    if hours:
-        result.append(f"{hours}h")
-
-    if minutes:
-        result.append(f"{minutes}m")
-
-    if not result or seconds:
-        result.append(f"{seconds}s")
-
-    return " ".join(result)
-
-
-# =========================================================
-# STATUS HELPERS
-# =========================================================
-
-def get_status(status):
-
-    if status == discord.Status.online:
-        return "online"
-
-    if status == discord.Status.idle:
-        return "idle"
-
-    if status == discord.Status.dnd:
-        return "dnd"
-
-    return "offline"
-
-
-def ensure_activity(member):
-
-    if member.bot:
-        return
-
-    cursor = db.cursor()
-
-    exists = cursor.execute(
-        """
-        SELECT 1
-        FROM activity
-        WHERE guild_id=? AND user_id=?
-        """,
-        (
-            member.guild.id,
-            member.id
-        )
-    ).fetchone()
-
-    if exists:
-        return
-
-    status = get_status(member.status)
-
-    cursor.execute(
-        """
-        INSERT INTO activity(
-            guild_id,
-            user_id,
-            active_seconds,
-            idle_seconds,
-            current_status,
-            last_change,
-            idle_since
-        )
-        VALUES(?,?,?,?,?,?,?)
-        """,
-        (
-            member.guild.id,
-            member.id,
-            0,
-            0,
-            status,
-            iso_time(utc_now()),
-            iso_time(utc_now())
-            if status == "idle"
-            else None
-        )
-    )
-
-    db.commit()
-
-
-def update_activity(member, new_status):
-
-    if member.bot:
-        return
-
-    now = utc_now()
-
-    cursor = db.cursor()
-
-    row = cursor.execute(
-        """
-        SELECT *
-        FROM activity
-        WHERE guild_id=? AND user_id=?
-        """,
-        (
-            member.guild.id,
-            member.id
-        )
-    ).fetchone()
-
-    if not row:
-        ensure_activity(member)
-        return
-
-    old_status = row["current_status"]
-
-    elapsed = max(
-        0,
-        (
-            now - parse_time(row["last_change"])
-        ).total_seconds()
-    )
-
-    active_seconds = float(row["active_seconds"])
-    idle_seconds = float(row["idle_seconds"])
-
-    if old_status in ("online", "dnd"):
-        active_seconds += elapsed
-
-    elif old_status == "idle":
-        idle_seconds += elapsed
-
-    idle_since = row["idle_since"]
-
-    if new_status == "idle" and old_status != "idle":
-        idle_since = iso_time(now)
-
-    elif new_status != "idle":
-        idle_since = None
-
-    cursor.execute(
-        """
-        UPDATE activity
-        SET
-            active_seconds=?,
-            idle_seconds=?,
-            current_status=?,
-            last_change=?,
-            idle_since=?
-        WHERE guild_id=? AND user_id=?
-        """,
-        (
-            active_seconds,
-            idle_seconds,
-            new_status,
-            iso_time(now),
-            idle_since,
-            member.guild.id,
-            member.id
-        )
-    )
-
-    db.commit()
-
-
-def get_total_activity(row):
-
-    total = (
-        float(row["active_seconds"])
-        + float(row["idle_seconds"])
-    )
-
-    if row["current_status"] in (
-        "online",
-        "idle",
-        "dnd"
-    ):
-        total += max(
-            0,
-            (
-                utc_now()
-                - parse_time(row["last_change"])
-            ).total_seconds()
-        )
-
-    return total
-
-
-def get_active_activity(row):
-
-    total = float(row["active_seconds"])
-
-    if row["current_status"] in (
-        "online",
-        "dnd"
-    ):
-        total += max(
-            0,
-            (
-                utc_now()
-                - parse_time(row["last_change"])
-            ).total_seconds()
-        )
-
-    return total
-
-
-def get_idle_activity(row):
-
-    total = float(row["idle_seconds"])
-
-    if row["current_status"] == "idle":
-        total += max(
-            0,
-            (
-                utc_now()
-                - parse_time(row["last_change"])
-            ).total_seconds()
-        )
-
-    return total
-
-
-# =========================================================
-# PERMISSION HELPERS
-# =========================================================
+# ============================================================
+# ORGANIZATIONS
+# ============================================================
+
+ORGANIZATIONS = {
+    "Government": "🏛️ Government",
+    "Military Unit": "🪖 Military Unit",
+    "ARZAMAS Hospital": "🏥 ARZAMAS Hospital",
+    "YUZHNEY Hospital": "🏥 YUZHNEY Hospital",
+    "Yuzhny Police Department": "🚓 Yuzhny Police Department",
+    "FBI": "🕵️ FBI",
+    "Arzamas Police Department": "🚓 Arzamas Police Department",
+    "News Network": "📰 News Network",
+
+    "Caucasian OCG": "🏴 Caucasian OCG",
+    "Orekhov OCG": "🏴 Orekhov OCG",
+    "Kurgan OCG": "🏴 Kurgan OCG",
+}
+
+ORG_ROLE_NAMES = set(ORGANIZATIONS.values())
+
+
+# ============================================================
+# STAFF ROLES
+# ============================================================
 
 STAFF_ROLE_NAMES = {
     "Founder",
@@ -381,7 +74,276 @@ STAFF_ROLE_NAMES = {
 }
 
 
+# ============================================================
+# DISCORD INTENTS
+# ============================================================
+
+intents = discord.Intents.default()
+
+intents.guilds = True
+intents.members = True
+intents.presences = True
+intents.message_content = True
+intents.messages = True
+
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+db = sqlite3.connect(
+    DB_FILE,
+    check_same_thread=False
+)
+
+db.row_factory = sqlite3.Row
+
+db_lock = __import__("threading").Lock()
+
+
+def db_execute(sql, params=(), fetch=False):
+    with db_lock:
+
+        cursor = db.cursor()
+
+        cursor.execute(
+            sql,
+            params
+        )
+
+        rows = None
+
+        if fetch:
+            rows = cursor.fetchall()
+
+        db.commit()
+
+        return rows
+
+
+def init_database():
+
+    # --------------------------------------------------------
+    # ORGANIZATION APPLICATIONS
+    # --------------------------------------------------------
+
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS applications (
+
+            channel_id INTEGER PRIMARY KEY,
+
+            user_id INTEGER NOT NULL,
+
+            organization TEXT NOT NULL,
+
+            created_at INTEGER NOT NULL,
+
+            status TEXT NOT NULL DEFAULT 'pending',
+
+            proof_received INTEGER NOT NULL DEFAULT 0,
+
+            reviewer_id INTEGER,
+
+            reason TEXT,
+
+            additional_info TEXT
+        )
+    """)
+
+
+    # --------------------------------------------------------
+    # ACTIVITY
+    # --------------------------------------------------------
+
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS activity (
+
+            user_id INTEGER PRIMARY KEY,
+
+            online_seconds INTEGER NOT NULL DEFAULT 0,
+
+            idle_seconds INTEGER NOT NULL DEFAULT 0,
+
+            dnd_seconds INTEGER NOT NULL DEFAULT 0,
+
+            session_count INTEGER NOT NULL DEFAULT 0,
+
+            first_tracked INTEGER NOT NULL,
+
+            last_seen INTEGER NOT NULL,
+
+            current_status TEXT NOT NULL DEFAULT 'offline',
+
+            status_started INTEGER NOT NULL
+        )
+    """)
+
+
+    # --------------------------------------------------------
+    # DAILY ACTIVITY
+    # --------------------------------------------------------
+
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS activity_daily (
+
+            user_id INTEGER NOT NULL,
+
+            day TEXT NOT NULL,
+
+            online_seconds INTEGER NOT NULL DEFAULT 0,
+
+            idle_seconds INTEGER NOT NULL DEFAULT 0,
+
+            dnd_seconds INTEGER NOT NULL DEFAULT 0,
+
+            PRIMARY KEY(user_id, day)
+        )
+    """)
+
+
+    # --------------------------------------------------------
+    # SETTINGS
+    # --------------------------------------------------------
+
+    db_execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+
+            key TEXT PRIMARY KEY,
+
+            value TEXT
+        )
+    """)
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def now_ts():
+
+    return int(
+        time.time()
+    )
+
+
+def utc_now():
+
+    return datetime.now(
+        timezone.utc
+    )
+
+
+def format_duration(seconds):
+
+    seconds = max(
+        0,
+        int(seconds)
+    )
+
+    days, seconds = divmod(
+        seconds,
+        86400
+    )
+
+    hours, seconds = divmod(
+        seconds,
+        3600
+    )
+
+    minutes, seconds = divmod(
+        seconds,
+        60
+    )
+
+    parts = []
+
+    if days:
+        parts.append(
+            f"{days}d"
+        )
+
+    if hours:
+        parts.append(
+            f"{hours}h"
+        )
+
+    if minutes:
+        parts.append(
+            f"{minutes}m"
+        )
+
+    if not parts:
+
+        parts.append(
+            f"{seconds}s"
+        )
+
+    return " ".join(parts)
+
+
+def timestamp_text(timestamp):
+
+    if not timestamp:
+
+        return "Unknown"
+
+    return datetime.fromtimestamp(
+        timestamp,
+        timezone.utc
+    ).strftime(
+        "%d %b %Y, %H:%M UTC"
+    )
+
+
+def get_guild():
+
+    return bot.get_guild(
+        GUILD_ID
+    )
+
+
+def get_role(guild, role_id):
+
+    if not guild:
+
+        return None
+
+    return guild.get_role(
+        role_id
+    )
+
+
+def find_role(guild, role_name):
+
+    if not guild:
+
+        return None
+
+    return discord.utils.get(
+        guild.roles,
+        name=role_name
+    )
+
+
+def get_master_role(guild):
+
+    return get_role(
+        guild,
+        MASTER_ROLE_ID
+    )
+
+
 def is_master(member):
+
+    if member.guild_permissions.administrator:
+
+        return True
 
     return any(
         role.id == MASTER_ROLE_ID
@@ -391,10 +353,15 @@ def is_master(member):
 
 def is_staff(member):
 
-    if is_master(member):
+    if member.guild_permissions.administrator:
+
         return True
 
-    if member.guild_permissions.administrator:
+    if any(
+        role.id == MASTER_ROLE_ID
+        for role in member.roles
+    ):
+
         return True
 
     return any(
@@ -403,290 +370,1144 @@ def is_staff(member):
     )
 
 
-# =========================================================
-# READY
-# =========================================================
+def get_organization_role(
+    guild,
+    organization
+):
 
-@bot.event
-async def on_ready():
+    role_name = ORGANIZATIONS.get(
+        organization
+    )
 
-    init_database()
+    if not role_name:
 
-    guild = bot.get_guild(GUILD_ID)
+        return None
 
-    if guild:
+    return find_role(
+        guild,
+        role_name
+    )
 
-        for member in guild.members:
-            ensure_activity(member)
+
+def get_member_org_roles(member):
+
+    return [
+        role
+        for role in member.roles
+        if role.name in ORG_ROLE_NAMES
+    ]
+
+
+def clean_channel_name(name):
+
+    name = name.lower()
+
+    name = re.sub(
+        r"[^a-z0-9-]+",
+        "-",
+        name
+    )
+
+    name = re.sub(
+        r"-+",
+        "-",
+        name
+    )
+
+    name = name.strip("-")
+
+    return (
+        name[:70]
+        or "application"
+    )
+
+
+# ============================================================
+# LOG SYSTEM
+# ============================================================
+
+async def send_log(
+    title,
+    description,
+    color=discord.Color.blurple(),
+    fields=None
+):
+
+    channel = bot.get_channel(
+        LOG_CHANNEL_ID
+    )
+
+    if not channel:
+
+        return
+
+    embed = discord.Embed(
+
+        title=title,
+
+        description=description,
+
+        color=color,
+
+        timestamp=utc_now()
+    )
+
+    if fields:
+
+        for name, value, inline in fields:
+
+            embed.add_field(
+                name=name,
+                value=value,
+                inline=inline
+            )
 
     try:
 
-        synced = await bot.tree.sync()
-
-        print(
-            f"SYNCED {len(synced)} COMMANDS"
+        await channel.send(
+            embed=embed
         )
 
-    except Exception as error:
+    except discord.HTTPException:
 
-        print(
-            f"SYNC ERROR: {error}"
-        )
-
-    print(
-        f"ONLINE: {bot.user} | {bot.user.id}"
-    )
+        pass
 
 
-# =========================================================
-# MEMBER JOIN
-# =========================================================
-
-@bot.event
-async def on_member_join(member):
-
-    if member.guild.id != GUILD_ID:
-        return
-
-    ensure_activity(member)
-
-
-# =========================================================
-# PRESENCE TRACKING
-# =========================================================
-
-@bot.event
-async def on_presence_update(before, after):
-
-    if after.guild.id != GUILD_ID:
-        return
-
-    if after.bot:
-        return
-
-    old_status = get_status(
-        before.status
-    )
-
-    new_status = get_status(
-        after.status
-    )
-
-    if old_status != new_status:
-
-        update_activity(
-            after,
-            new_status
-        )
-
-
-# =========================================================
-# ANTI-LINK
-# =========================================================
-
-@bot.event
-async def on_message(message):
-
-    if message.author.bot:
-        return
-
-    if message.guild:
-
-        if message.guild.id == GUILD_ID:
-
-            member = message.author
-
-            # MASTER BYPASS
-            if not is_master(member):
-
-                content = message.content or ""
-
-                detected = URL_PATTERN.search(
-                    content
-                )
-
-                if detected:
-
-                    # DELETE
-                    try:
-
-                        await message.delete()
-
-                    except discord.HTTPException:
-                        pass
-
-                    # TIMEOUT
-                    try:
-
-                        await member.timeout(
-                            timedelta(minutes=10),
-                            reason="Unauthorized link detected"
-                        )
-
-                        print(
-                            f"ANTI-LINK: "
-                            f"{member} timed out"
-                        )
-
-                    except discord.Forbidden:
-
-                        print(
-                            f"ANTI-LINK ERROR: "
-                            f"Cannot timeout {member}"
-                        )
-
-                    except discord.HTTPException as error:
-
-                        print(
-                            f"ANTI-LINK ERROR: {error}"
-                        )
-
-                    return
-
-    await bot.process_commands(message)
-
-
-# =========================================================
-# VERIFICATION MODAL
-# =========================================================
-
-class VerificationModal(
-    discord.ui.Modal,
-    title="Organization Application"
+async def safe_ephemeral(
+    interaction,
+    content=None,
+    embed=None
 ):
 
-    character_name = discord.ui.TextInput(
-        label="Character Name",
-        placeholder="Enter character name",
-        max_length=80
-    )
+    try:
 
-    character_age = discord.ui.TextInput(
-        label="Character Age",
-        placeholder="Enter character age",
-        max_length=3
-    )
+        if interaction.response.is_done():
 
-    experience = discord.ui.TextInput(
-        label="RP Experience",
-        placeholder="Tell us about your RP experience",
-        style=discord.TextStyle.paragraph,
-        max_length=1000
-    )
-
-    def __init__(self, organization):
-
-        super().__init__()
-
-        self.organization = organization
-
-    async def on_submit(self, interaction):
-
-        cursor = db.cursor()
-
-        cursor.execute(
-            """
-            INSERT INTO verification(
-                guild_id,
-                user_id,
-                organization,
-                character_name,
-                character_age,
-                experience,
-                status,
-                created_at
+            await interaction.followup.send(
+                content=content,
+                embed=embed,
+                ephemeral=True
             )
-            VALUES(?,?,?,?,?,?,?,?)
+
+        else:
+
+            await interaction.response.send_message(
+                content=content,
+                embed=embed,
+                ephemeral=True
+            )
+
+    except discord.HTTPException:
+
+        pass
+
+
+# ============================================================
+# ACTIVITY STATUS
+# ============================================================
+
+def normalize_status(status):
+
+    if status == discord.Status.online:
+
+        return "online"
+
+    if status == discord.Status.idle:
+
+        return "idle"
+
+    if status == discord.Status.dnd:
+
+        return "dnd"
+
+    return "offline"
+
+
+def ensure_activity_member(member):
+
+    timestamp = now_ts()
+
+    status = normalize_status(
+        member.status
+    )
+
+    existing = db_execute(
+        """
+        SELECT user_id
+        FROM activity
+        WHERE user_id=?
+        """,
+        (member.id,),
+        fetch=True
+    )
+
+    if existing:
+
+        return
+
+    db_execute(
+        """
+        INSERT INTO activity
+        (
+            user_id,
+            online_seconds,
+            idle_seconds,
+            dnd_seconds,
+            session_count,
+            first_tracked,
+            last_seen,
+            current_status,
+            status_started
+        )
+
+        VALUES
+        (
+            ?,
+            0,
+            0,
+            0,
+            0,
+            ?,
+            ?,
+            ?,
+            ?
+        )
+        """,
+        (
+            member.id,
+            timestamp,
+            timestamp,
+            status,
+            timestamp
+        )
+    )
+
+
+def add_activity_seconds(
+    user_id,
+    status,
+    seconds
+):
+
+    if seconds <= 0:
+
+        return
+
+    if status not in {
+        "online",
+        "idle",
+        "dnd"
+    }:
+
+        return
+
+    column = f"{status}_seconds"
+
+    db_execute(
+        f"""
+        UPDATE activity
+
+        SET
+            {column} = {column} + ?,
+            last_seen = ?
+
+        WHERE user_id=?
+        """,
+        (
+            seconds,
+            now_ts(),
+            user_id
+        )
+    )
+
+    today = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d"
+    )
+
+    db_execute(
+        f"""
+        INSERT INTO activity_daily
+        (
+            user_id,
+            day,
+            {column}
+        )
+
+        VALUES
+        (
+            ?,
+            ?,
+            ?
+        )
+
+        ON CONFLICT(user_id, day)
+
+        DO UPDATE SET
+            {column} =
+            {column} + excluded.{column}
+        """,
+        (
+            user_id,
+            today,
+            seconds
+        )
+    )
+
+
+async def process_presence(
+    member,
+    before_status,
+    after_status
+):
+
+    old_status = normalize_status(
+        before_status
+    )
+
+    new_status = normalize_status(
+        after_status
+    )
+
+    if old_status == new_status:
+
+        return
+
+    ensure_activity_member(
+        member
+    )
+
+    row = db_execute(
+        """
+        SELECT
+            current_status,
+            status_started
+
+        FROM activity
+
+        WHERE user_id=?
+        """,
+        (member.id,),
+        fetch=True
+    )
+
+    if row:
+
+        current_status = row[0][
+            "current_status"
+        ]
+
+        started = row[0][
+            "status_started"
+        ]
+
+        elapsed = max(
+            0,
+            now_ts() - started
+        )
+
+        add_activity_seconds(
+            member.id,
+            current_status,
+            elapsed
+        )
+
+    if (
+        old_status == "offline"
+        and new_status
+        in {
+            "online",
+            "idle",
+            "dnd"
+        }
+    ):
+
+        db_execute(
+            """
+            UPDATE activity
+
+            SET session_count =
+                session_count + 1
+
+            WHERE user_id=?
+            """,
+            (member.id,)
+        )
+
+    db_execute(
+        """
+        UPDATE activity
+
+        SET
+            current_status=?,
+            status_started=?,
+            last_seen=?
+
+        WHERE user_id=?
+        """,
+        (
+            new_status,
+            now_ts(),
+            now_ts(),
+            member.id
+        )
+    )
+
+
+async def flush_activity():
+
+    guild = get_guild()
+
+    if not guild:
+
+        return
+
+    current_time = now_ts()
+
+    for member in guild.members:
+
+        row = db_execute(
+            """
+            SELECT
+                current_status,
+                status_started
+
+            FROM activity
+
+            WHERE user_id=?
+            """,
+            (member.id,),
+            fetch=True
+        )
+
+        if not row:
+
+            continue
+
+        status = row[0][
+            "current_status"
+        ]
+
+        started = row[0][
+            "status_started"
+        ]
+
+        elapsed = max(
+            0,
+            current_time - started
+        )
+
+        if status in {
+            "online",
+            "idle",
+            "dnd"
+        }:
+
+            add_activity_seconds(
+                member.id,
+                status,
+                elapsed
+            )
+
+        db_execute(
+            """
+            UPDATE activity
+
+            SET status_started=?
+
+            WHERE user_id=?
             """,
             (
-                interaction.guild.id,
-                interaction.user.id,
-                self.organization,
-                self.character_name.value,
-                self.character_age.value,
-                self.experience.value,
-                "pending",
-                iso_time(utc_now())
+                current_time,
+                member.id
             )
         )
 
-        request_id = cursor.lastrowid
 
-        db.commit()
+@tasks.loop(minutes=1)
+async def activity_flush():
 
-        embed = discord.Embed(
-            title="📋 New Organization Application",
-            color=discord.Color.blurple()
+    await flush_activity()
+
+
+# ============================================================
+# ACTIVITY DATA HELPER
+# ============================================================
+
+def get_activity_data(user_id):
+
+    rows = db_execute(
+        """
+        SELECT
+
+            online_seconds,
+            idle_seconds,
+            dnd_seconds,
+            session_count,
+            first_tracked,
+            last_seen,
+            current_status,
+            status_started
+
+        FROM activity
+
+        WHERE user_id=?
+        """,
+        (user_id,),
+        fetch=True
+    )
+
+    if not rows:
+
+        return None
+
+    data = dict(
+        rows[0]
+    )
+
+    current_status = data[
+        "current_status"
+    ]
+
+    if current_status in {
+        "online",
+        "idle",
+        "dnd"
+    }:
+
+        current_seconds = max(
+            0,
+            now_ts() -
+            data["status_started"]
         )
 
-        embed.add_field(
-            name="Applicant",
-            value=interaction.user.mention,
-            inline=False
-        )
+        data[
+            f"{current_status}_seconds"
+        ] += current_seconds
 
-        embed.add_field(
-            name="Organization",
-            value=self.organization,
-            inline=True
-        )
+    data["total_seconds"] = (
+        data["online_seconds"]
+        +
+        data["idle_seconds"]
+        +
+        data["dnd_seconds"]
+    )
 
-        embed.add_field(
-            name="Character",
-            value=self.character_name.value,
-            inline=True
-        )
-
-        embed.add_field(
-            name="Age",
-            value=self.character_age.value,
-            inline=True
-        )
-
-        embed.add_field(
-            name="Experience",
-            value=self.experience.value,
-            inline=False
-        )
-
-        embed.set_footer(
-            text=f"Application #{request_id}"
-        )
-
-        await interaction.response.send_message(
-            "✅ Application submitted successfully.",
-            ephemeral=True
-        )
-
-        print(
-            f"APPLICATION #{request_id}"
-        )
+    return data
 
 
-class OrganizationButton(
-    discord.ui.Button
-):
+# ============================================================
+# INITIAL DATABASE
+# ============================================================
 
-    def __init__(self, organization):
+init_database()
+
+
+# ============================================================
+# END OF PART 1
+# ============================================================
+# ============================================================
+# PART 2
+# ORGANIZATION APPLICATION + VERIFICATION SYSTEM
+# ============================================================
+
+
+# ============================================================
+# ORGANIZATION PANEL
+# ============================================================
+
+class OrganizationPanelView(discord.ui.View):
+
+    def __init__(self):
 
         super().__init__(
-            label=organization,
-            style=discord.ButtonStyle.primary,
-            custom_id=f"org_apply_{organization}"
+            timeout=None
         )
 
-        self.organization = organization
 
-    async def callback(self, interaction):
+    async def create_application(
+        self,
+        interaction,
+        organization
+    ):
 
-        await interaction.response.send_modal(
-            VerificationModal(
-                self.organization
+        guild = interaction.guild
+
+        if not guild:
+
+            return
+
+
+        member = interaction.user
+
+
+        # ----------------------------------------------------
+        # CHECK EXISTING SAME ROLE
+        # ----------------------------------------------------
+
+        org_role = get_organization_role(
+            guild,
+            organization
+        )
+
+        if org_role and org_role in member.roles:
+
+            await safe_ephemeral(
+                interaction,
+                f"❌ You already have the **{org_role.name}** role."
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # CHECK PENDING APPLICATION
+        # ----------------------------------------------------
+
+        pending = db_execute(
+            """
+            SELECT channel_id
+            FROM applications
+            WHERE user_id=?
+            AND status='pending'
+            """,
+            (member.id,),
+            fetch=True
+        )
+
+        if pending:
+
+            channel_id = pending[0][
+                "channel_id"
+            ]
+
+            existing_channel = guild.get_channel(
+                channel_id
+            )
+
+            if existing_channel:
+
+                await safe_ephemeral(
+                    interaction,
+                    f"⚠️ You already have an active application: {existing_channel.mention}"
+                )
+
+                return
+
+            else:
+
+                db_execute(
+                    """
+                    UPDATE applications
+                    SET status='closed'
+                    WHERE channel_id=?
+                    """,
+                    (channel_id,)
+                )
+
+
+        # ----------------------------------------------------
+        # CATEGORY
+        # ----------------------------------------------------
+
+        category = guild.get_channel(
+            APPLICATION_CATEGORY_ID
+        )
+
+        if not isinstance(
+            category,
+            discord.CategoryChannel
+        ):
+
+            await safe_ephemeral(
+                interaction,
+                "❌ Application category was not found."
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # MASTER ROLE
+        # ----------------------------------------------------
+
+        master_role = get_master_role(
+            guild
+        )
+
+
+        # ----------------------------------------------------
+        # CHANNEL NAME
+        # ----------------------------------------------------
+
+        channel_name = clean_channel_name(
+            f"apply-{organization}-{member.display_name}"
+        )
+
+
+        # ----------------------------------------------------
+        # PERMISSIONS
+        # ----------------------------------------------------
+
+        overwrites = {
+
+            guild.default_role:
+                discord.PermissionOverwrite(
+                    view_channel=False
+                ),
+
+            member:
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True
+                )
+        }
+
+
+        if master_role:
+
+            overwrites[
+                master_role
+            ] = discord.PermissionOverwrite(
+
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True
+            )
+
+
+        # ----------------------------------------------------
+        # CREATE APPLICATION CHANNEL
+        # ----------------------------------------------------
+
+        try:
+
+            channel = await guild.create_text_channel(
+
+                name=channel_name,
+
+                category=category,
+
+                overwrites=overwrites,
+
+                reason=(
+                    f"Organization application: "
+                    f"{organization} by {member}"
+                )
+            )
+
+        except discord.Forbidden:
+
+            await safe_ephemeral(
+                interaction,
+                "❌ Bot does not have permission to create application channels."
+            )
+
+            return
+
+        except discord.HTTPException:
+
+            await safe_ephemeral(
+                interaction,
+                "❌ Failed to create the application channel."
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # SAVE APPLICATION
+        # ----------------------------------------------------
+
+        db_execute(
+            """
+            INSERT INTO applications
+            (
+                channel_id,
+                user_id,
+                organization,
+                created_at,
+                status,
+                proof_received
+            )
+
+            VALUES
+            (
+                ?,
+                ?,
+                ?,
+                ?,
+                'pending',
+                0
+            )
+            """,
+            (
+                channel.id,
+                member.id,
+                organization,
+                now_ts()
             )
         )
 
 
-class OrganizationPanel(
+        # ----------------------------------------------------
+        # EMBED
+        # ----------------------------------------------------
+
+        embed = discord.Embed(
+
+            title="📋 Organization Application",
+
+            description=(
+                f"Welcome {member.mention}.\n\n"
+                f"Your application for "
+                f"**{ORGANIZATIONS[organization]}** "
+                f"has been created.\n\n"
+                "### 📌 Application Requirements\n"
+                "• Explain why you want to join.\n"
+                "• Provide relevant information about yourself.\n"
+                "• **Proof is mandatory.**\n"
+                "• Upload your proof directly in this channel.\n\n"
+                "### 🔐 Verification\n"
+                "A Master/Admin will review your application.\n"
+                "Do not delete your proof after sending it.\n\n"
+                "Please wait for the verification team."
+            ),
+
+            color=discord.Color.blurple(),
+
+            timestamp=utc_now()
+        )
+
+
+        embed.add_field(
+
+            name="👤 Applicant",
+
+            value=member.mention,
+
+            inline=True
+        )
+
+
+        embed.add_field(
+
+            name="🏢 Organization",
+
+            value=ORGANIZATIONS[organization],
+
+            inline=True
+        )
+
+
+        embed.add_field(
+
+            name="📎 Proof",
+
+            value="❌ Not received",
+
+            inline=True
+        )
+
+
+        embed.set_footer(
+            text="Modern City RP • Organization Verification"
+        )
+
+
+        review_view = ApplicationReviewView()
+
+
+        mention_content = member.mention
+
+        if master_role:
+
+            mention_content += (
+                f" {master_role.mention}"
+            )
+
+
+        try:
+
+            await channel.send(
+
+                content=mention_content,
+
+                embed=embed,
+
+                view=review_view,
+
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=True
+                )
+            )
+
+        except discord.HTTPException:
+
+            pass
+
+
+        # ----------------------------------------------------
+        # USER RESPONSE
+        # ----------------------------------------------------
+
+        await safe_ephemeral(
+
+            interaction,
+
+            f"✅ Your application has been created: {channel.mention}"
+        )
+
+
+        # ----------------------------------------------------
+        # LOG
+        # ----------------------------------------------------
+
+        await send_log(
+
+            "📋 New Organization Application",
+
+            f"{member.mention} created an application.",
+
+            discord.Color.blurple(),
+
+            fields=[
+
+                (
+                    "Applicant",
+                    f"{member.mention}\n`{member.id}`",
+                    False
+                ),
+
+                (
+                    "Organization",
+                    ORGANIZATIONS[organization],
+                    True
+                ),
+
+                (
+                    "Application",
+                    channel.mention,
+                    True
+                )
+            ]
+        )
+
+
+    # ========================================================
+    # BUTTONS
+    # ========================================================
+
+    @discord.ui.button(
+        label="Government",
+        emoji="🏛️",
+        style=discord.ButtonStyle.primary,
+        custom_id="org_government"
+    )
+    async def government(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "Government"
+        )
+
+
+    @discord.ui.button(
+        label="Military Unit",
+        emoji="🪖",
+        style=discord.ButtonStyle.primary,
+        custom_id="org_military"
+    )
+    async def military(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "Military Unit"
+        )
+
+
+    @discord.ui.button(
+        label="ARZAMAS Hospital",
+        emoji="🏥",
+        style=discord.ButtonStyle.success,
+        custom_id="org_arzamas_hospital"
+    )
+    async def arzamas_hospital(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "ARZAMAS Hospital"
+        )
+
+
+    @discord.ui.button(
+        label="YUZHNEY Hospital",
+        emoji="🏥",
+        style=discord.ButtonStyle.success,
+        custom_id="org_yuzhney_hospital"
+    )
+    async def yuzhney_hospital(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "YUZHNEY Hospital"
+        )
+
+
+    @discord.ui.button(
+        label="Yuzhny Police",
+        emoji="🚓",
+        style=discord.ButtonStyle.danger,
+        custom_id="org_yuzhny_police"
+    )
+    async def yuzhny_police(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "Yuzhny Police Department"
+        )
+
+
+    @discord.ui.button(
+        label="FBI",
+        emoji="🕵️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="org_fbi"
+    )
+    async def fbi(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "FBI"
+        )
+
+
+    @discord.ui.button(
+        label="Arzamas Police",
+        emoji="🚓",
+        style=discord.ButtonStyle.danger,
+        custom_id="org_arzamas_police"
+    )
+    async def arzamas_police(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "Arzamas Police Department"
+        )
+
+
+    @discord.ui.button(
+        label="News Network",
+        emoji="📰",
+        style=discord.ButtonStyle.secondary,
+        custom_id="org_news"
+    )
+    async def news(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "News Network"
+        )
+
+
+    @discord.ui.button(
+        label="Caucasian OCG",
+        emoji="🏴",
+        style=discord.ButtonStyle.danger,
+        custom_id="org_caucasian"
+    )
+    async def caucasian(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "Caucasian OCG"
+        )
+
+
+    @discord.ui.button(
+        label="Orekhov OCG",
+        emoji="🏴",
+        style=discord.ButtonStyle.danger,
+        custom_id="org_orekhov"
+    )
+    async def orekhov(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "Orekhov OCG"
+        )
+
+
+    @discord.ui.button(
+        label="Kurgan OCG",
+        emoji="🏴",
+        style=discord.ButtonStyle.danger,
+        custom_id="org_kurgan"
+    )
+    async def kurgan(
+        self,
+        interaction,
+        button
+    ):
+
+        await self.create_application(
+            interaction,
+            "Kurgan OCG"
+        )
+
+
+# ============================================================
+# APPLICATION REVIEW VIEW
+# ============================================================
+
+class ApplicationReviewView(
     discord.ui.View
 ):
 
@@ -696,899 +1517,802 @@ class OrganizationPanel(
             timeout=None
         )
 
-        organizations = [
-            "Government",
-            "Army",
-            "EMERCOM",
-            "Yuzhny Hospital"
+
+    # ========================================================
+    # GET APPLICATION
+    # ========================================================
+
+    def get_application(
+        self,
+        channel_id
+    ):
+
+        rows = db_execute(
+
+            """
+            SELECT *
+
+            FROM applications
+
+            WHERE channel_id=?
+            """,
+
+            (channel_id,),
+
+            fetch=True
+        )
+
+        if not rows:
+
+            return None
+
+        return rows[0]
+
+
+    # ========================================================
+    # APPROVE
+    # ========================================================
+
+    @discord.ui.button(
+        label="Approve",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="application_approve"
+    )
+    async def approve(
+        self,
+        interaction,
+        button
+    ):
+
+        if not is_master(
+            interaction.user
+        ):
+
+            await safe_ephemeral(
+                interaction,
+                "❌ Only Master/Admin can approve applications."
+            )
+
+            return
+
+
+        application = self.get_application(
+            interaction.channel.id
+        )
+
+        if not application:
+
+            await safe_ephemeral(
+                interaction,
+                "❌ Application data was not found."
+            )
+
+            return
+
+
+        if application["status"] != "pending":
+
+            await safe_ephemeral(
+                interaction,
+                "⚠️ This application is already closed."
+            )
+
+            return
+
+
+        guild = interaction.guild
+
+        applicant = guild.get_member(
+            application["user_id"]
+        )
+
+        if not applicant:
+
+            await safe_ephemeral(
+                interaction,
+                "❌ Applicant is no longer in the server."
+            )
+
+            return
+
+
+        organization = application[
+            "organization"
         ]
 
-        for organization in organizations:
+        new_role = get_organization_role(
+            guild,
+            organization
+        )
 
-            self.add_item(
-                OrganizationButton(
-                    organization
+        if not new_role:
+
+            await safe_ephemeral(
+
+                interaction,
+
+                f"❌ The role **{ORGANIZATIONS[organization]}** "
+                "was not found in the server.\n\n"
+                "Create the role with the exact name first."
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # BOT ROLE HIERARCHY CHECK
+        # ----------------------------------------------------
+
+        if new_role >= guild.me.top_role:
+
+            await safe_ephemeral(
+
+                interaction,
+
+                "❌ I cannot manage this role because "
+                "my bot role is not above it."
+            )
+
+            return
+
+
+        # ----------------------------------------------------
+        # REMOVE OLD ORGANIZATION ROLES
+        # ----------------------------------------------------
+
+        old_roles = get_member_org_roles(
+            applicant
+        )
+
+        removed_names = []
+
+        for old_role in old_roles:
+
+            if old_role == new_role:
+
+                continue
+
+            try:
+
+                await applicant.remove_roles(
+                    old_role,
+                    reason=(
+                        "Organization switch "
+                        "approved by Master"
+                    )
+                )
+
+                removed_names.append(
+                    old_role.name
+                )
+
+            except discord.Forbidden:
+
+                await safe_ephemeral(
+
+                    interaction,
+
+                    f"❌ I cannot remove `{old_role.name}`. "
+                    "Check role hierarchy."
+                )
+
+                return
+
+
+        # ----------------------------------------------------
+        # ADD NEW ROLE
+        # ----------------------------------------------------
+
+        try:
+
+            await applicant.add_roles(
+
+                new_role,
+
+                reason=(
+                    f"Organization application approved "
+                    f"by {interaction.user}"
                 )
             )
 
+        except discord.Forbidden:
 
-@bot.tree.command(
-    name="orgpanel",
-    description="Show organization application panel."
-)
-async def orgpanel(interaction):
+            await safe_ephemeral(
 
-    if not is_staff(interaction.user):
+                interaction,
 
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    embed = discord.Embed(
-        title="🏛️ Modern City Organizations",
-        description=(
-            "Select an organization below "
-            "to submit your application."
-        ),
-        color=discord.Color.blurple()
-    )
-
-    await interaction.response.send_message(
-        embed=embed,
-        view=OrganizationPanel()
-    )
-
-
-# =========================================================
-# WARN
-# =========================================================
-
-@bot.tree.command(
-    name="warn",
-    description="Warn a member."
-)
-@app_commands.describe(
-    member="Member",
-    reason="Warning reason"
-)
-async def warn(
-    interaction,
-    member: discord.Member,
-    reason: str
-):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    db.execute(
-        """
-        INSERT INTO warnings(
-            guild_id,
-            user_id,
-            reason,
-            issuer_id,
-            created_at
-        )
-        VALUES(?,?,?,?,?)
-        """,
-        (
-            interaction.guild.id,
-            member.id,
-            reason,
-            interaction.user.id,
-            iso_time(utc_now())
-        )
-    )
-
-    db.commit()
-
-    await interaction.response.send_message(
-        f"⚠️ {member.mention} has been warned.\n"
-        f"**Reason:** {reason}"
-    )
-
-
-# =========================================================
-# WARNINGS
-# =========================================================
-
-@bot.tree.command(
-    name="warnings",
-    description="View member warnings."
-)
-@app_commands.describe(
-    member="Member"
-)
-async def warnings(
-    interaction,
-    member: discord.Member
-):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    rows = db.execute(
-        """
-        SELECT *
-        FROM warnings
-        WHERE guild_id=? AND user_id=?
-        ORDER BY id DESC
-        LIMIT 15
-        """,
-        (
-            interaction.guild.id,
-            member.id
-        )
-    ).fetchall()
-
-    if not rows:
-
-        return await interaction.response.send_message(
-            f"✅ {member.mention} has no warnings."
-        )
-
-    text = []
-
-    for index, row in enumerate(
-        rows,
-        start=1
-    ):
-
-        text.append(
-            f"**{index}.** {row['reason']}\n"
-            f"By <@{row['issuer_id']}>"
-        )
-
-    embed = discord.Embed(
-        title=f"⚠️ Warnings • {member}",
-        description="\n\n".join(text),
-        color=discord.Color.orange()
-    )
-
-    await interaction.response.send_message(
-        embed=embed
-    )
-
-
-# =========================================================
-# CLEAR WARNINGS
-# =========================================================
-
-@bot.tree.command(
-    name="clearwarnings",
-    description="Clear member warnings."
-)
-@app_commands.describe(
-    member="Member"
-)
-async def clearwarnings(
-    interaction,
-    member: discord.Member
-):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    db.execute(
-        """
-        DELETE FROM warnings
-        WHERE guild_id=? AND user_id=?
-        """,
-        (
-            interaction.guild.id,
-            member.id
-        )
-    )
-
-    db.commit()
-
-    await interaction.response.send_message(
-        f"🧹 Cleared warnings for {member.mention}."
-    )
-
-
-# =========================================================
-# KICK
-# =========================================================
-
-@bot.tree.command(
-    name="kick",
-    description="Kick a member."
-)
-@app_commands.describe(
-    member="Member",
-    reason="Reason"
-)
-async def kick(
-    interaction,
-    member: discord.Member,
-    reason: str = "No reason provided"
-):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    try:
-
-        await member.kick(
-            reason=reason
-        )
-
-        await interaction.response.send_message(
-            f"👢 Kicked {member.mention}."
-        )
-
-    except discord.Forbidden:
-
-        await interaction.response.send_message(
-            "❌ I cannot kick this member.",
-            ephemeral=True
-        )
-
-
-# =========================================================
-# BAN
-# =========================================================
-
-@bot.tree.command(
-    name="ban",
-    description="Ban a member."
-)
-@app_commands.describe(
-    member="Member",
-    reason="Reason"
-)
-async def ban(
-    interaction,
-    member: discord.Member,
-    reason: str = "No reason provided"
-):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    try:
-
-        await member.ban(
-            reason=reason
-        )
-
-        await interaction.response.send_message(
-            f"🔨 Banned {member.mention}."
-        )
-
-    except discord.Forbidden:
-
-        await interaction.response.send_message(
-            "❌ I cannot ban this member.",
-            ephemeral=True
-        )
-
-
-# =========================================================
-# TIMEOUT
-# =========================================================
-
-@bot.tree.command(
-    name="timeout",
-    description="Timeout a member."
-)
-@app_commands.describe(
-    member="Member",
-    minutes="Duration in minutes",
-    reason="Reason"
-)
-async def timeout(
-    interaction,
-    member: discord.Member,
-    minutes: int,
-    reason: str = "No reason provided"
-):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    if minutes < 1 or minutes > 40320:
-
-        return await interaction.response.send_message(
-            "❌ Duration must be 1 to 40320 minutes.",
-            ephemeral=True
-        )
-
-    try:
-
-        await member.timeout(
-            timedelta(minutes=minutes),
-            reason=reason
-        )
-
-        await interaction.response.send_message(
-            f"🔇 {member.mention} timed out "
-            f"for **{minutes} minutes**."
-        )
-
-    except discord.Forbidden:
-
-        await interaction.response.send_message(
-            "❌ I cannot timeout this member.",
-            ephemeral=True
-        )
-
-
-# =========================================================
-# CLEAR
-# =========================================================
-
-@bot.tree.command(
-    name="clear",
-    description="Delete messages."
-)
-@app_commands.describe(
-    amount="Number of messages"
-)
-async def clear(
-    interaction,
-    amount: int
-):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    if amount < 1 or amount > 100:
-
-        return await interaction.response.send_message(
-            "❌ Amount must be between 1 and 100.",
-            ephemeral=True
-        )
-
-    await interaction.response.defer(
-        ephemeral=True
-    )
-
-    deleted = await interaction.channel.purge(
-        limit=amount
-    )
-
-    await interaction.followup.send(
-        f"🧹 Deleted **{len(deleted)}** messages.",
-        ephemeral=True
-    )
-
-
-# =========================================================
-# ACTIVITY
-# =========================================================
-
-@bot.tree.command(
-    name="activity",
-    description="View tracked server activity."
-)
-@app_commands.describe(
-    member="Member to check"
-)
-async def activity(
-    interaction,
-    member: discord.Member | None = None
-):
-
-    member = member or interaction.user
-
-    if (
-        member.id != interaction.user.id
-        and not is_staff(interaction.user)
-    ):
-
-        return await interaction.response.send_message(
-            "❌ You can only view your own activity.",
-            ephemeral=True
-        )
-
-    ensure_activity(member)
-
-    row = db.execute(
-        """
-        SELECT *
-        FROM activity
-        WHERE guild_id=? AND user_id=?
-        """,
-        (
-            interaction.guild.id,
-            member.id
-        )
-    ).fetchone()
-
-    total = get_total_activity(row)
-    active = get_active_activity(row)
-    idle = get_idle_activity(row)
-
-    embed = discord.Embed(
-        title=f"📊 Activity • {member.display_name}",
-        color=discord.Color.blurple()
-    )
-
-    embed.add_field(
-        name="Status",
-        value=row["current_status"].upper(),
-        inline=True
-    )
-
-    embed.add_field(
-        name="Total Tracked",
-        value=format_duration(total),
-        inline=True
-    )
-
-    embed.add_field(
-        name="Active Time",
-        value=format_duration(active),
-        inline=True
-    )
-
-    embed.add_field(
-        name="AFK / Idle",
-        value=format_duration(idle),
-        inline=True
-    )
-
-    if member.joined_at:
-
-        embed.add_field(
-            name="Server Joined",
-            value=discord.utils.format_dt(
-                member.joined_at,
-                "R"
-            ),
-            inline=True
-        )
-
-    await interaction.response.send_message(
-        embed=embed
-    )
-
-
-# =========================================================
-# ACTIVITY BOARD
-# =========================================================
-
-@bot.tree.command(
-    name="activityboard",
-    description="Show activity leaderboard."
-)
-async def activityboard(interaction):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    rows = db.execute(
-        """
-        SELECT *
-        FROM activity
-        WHERE guild_id=?
-        """,
-        (
-            interaction.guild.id,
-        )
-    ).fetchall()
-
-    rows = sorted(
-        rows,
-        key=get_total_activity,
-        reverse=True
-    )
-
-    lines = []
-
-    position = 1
-
-    for row in rows:
-
-        member = interaction.guild.get_member(
-            row["user_id"]
-        )
-
-        if not member or member.bot:
-            continue
-
-        lines.append(
-            f"**{position}.** "
-            f"{member.mention} • "
-            f"`{format_duration(get_total_activity(row))}`"
-        )
-
-        position += 1
-
-        if position > 15:
-            break
-
-    embed = discord.Embed(
-        title="🏆 Server Activity",
-        description="\n".join(lines)
-        or "No activity data yet.",
-        color=discord.Color.gold()
-    )
-
-    await interaction.response.send_message(
-        embed=embed
-    )
-
-
-# =========================================================
-# AFK LIST
-# =========================================================
-
-@bot.tree.command(
-    name="afklist",
-    description="Show currently idle members."
-)
-async def afklist(interaction):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    rows = db.execute(
-        """
-        SELECT *
-        FROM activity
-        WHERE guild_id=?
-        AND current_status='idle'
-        ORDER BY idle_since ASC
-        """,
-        (
-            interaction.guild.id,
-        )
-    ).fetchall()
-
-    lines = []
-
-    now = utc_now()
-
-    for row in rows:
-
-        member = interaction.guild.get_member(
-            row["user_id"]
-        )
-
-        if not member or member.bot:
-            continue
-
-        if row["idle_since"]:
-
-            idle_since = parse_time(
-                row["idle_since"]
+                "❌ I cannot add the organization role. "
+                "Check role hierarchy."
             )
 
-            duration = (
-                now - idle_since
-            ).total_seconds()
+            return
 
-        else:
 
-            duration = 0
+        # ----------------------------------------------------
+        # ENSURE CITIZEN ROLE
+        # ----------------------------------------------------
 
-        lines.append(
-            f"{member.mention} • "
-            f"`{format_duration(duration)}`"
+        citizen_role = get_role(
+            guild,
+            CITIZEN_ROLE_ID
         )
 
-        if len(lines) >= 20:
-            break
+        if citizen_role:
 
-    embed = discord.Embed(
-        title="💤 Current AFK / Idle",
-        description="\n".join(lines)
-        or "Nobody is currently idle.",
-        color=discord.Color.orange()
+            try:
+
+                if citizen_role not in applicant.roles:
+
+                    await applicant.add_roles(
+                        citizen_role,
+                        reason="Citizen role retention"
+                    )
+
+            except discord.Forbidden:
+
+                pass
+
+
+        # ----------------------------------------------------
+        # DATABASE
+        # ----------------------------------------------------
+
+        db_execute(
+
+            """
+            UPDATE applications
+
+            SET
+                status='approved',
+                reviewer_id=?
+
+            WHERE channel_id=?
+            """,
+
+            (
+                interaction.user.id,
+                interaction.channel.id
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # SUCCESS MESSAGE
+        # ----------------------------------------------------
+
+        await safe_ephemeral(
+
+            interaction,
+
+            f"✅ Application approved.\n"
+            f"{applicant.mention} received "
+            f"**{new_role.name}**."
+        )
+
+
+        # --------------------------------------------------------
+    # LOG
+    # --------------------------------------------------------
+
+    await send_log(
+
+        "📎 Application Proof Received",
+
+        f"{message.author.mention} uploaded proof.",
+
+        discord.Color.blue(),
+
+        fields=[
+
+            (
+                "Organization",
+                ORGANIZATIONS.get(
+                    application["organization"],
+                    application["organization"]
+                ),
+                True
+            ),
+
+            (
+                "Application",
+                message.channel.mention,
+                True
+            ),
+
+            (
+                "Files",
+                file_text[:1000],
+                False
+            )
+        ]
     )
 
-    await interaction.response.send_message(
-        embed=embed
-    )
 
+# ============================================================
+# ORGANIZATION PANEL EMBED
+# ============================================================
 
-# =========================================================
-# SERVER ACTIVITY
-# =========================================================
-
-@bot.tree.command(
-    name="serveractivity",
-    description="Show overall server activity."
-)
-async def serveractivity(interaction):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    rows = db.execute(
-        """
-        SELECT *
-        FROM activity
-        WHERE guild_id=?
-        """,
-        (
-            interaction.guild.id,
-        )
-    ).fetchall()
-
-    online = 0
-    idle = 0
-    dnd = 0
-
-    for row in rows:
-
-        if row["current_status"] == "online":
-            online += 1
-
-        elif row["current_status"] == "idle":
-            idle += 1
-
-        elif row["current_status"] == "dnd":
-            dnd += 1
+def organization_panel_embed():
 
     embed = discord.Embed(
-        title="📊 Modern City Server Activity",
+
+        title="🏢 MODERN CITY RP",
+        description=(
+            "**Organization Recruitment Center**\n\n"
+            "Choose the organization you want to apply for.\n\n"
+            "📋 **Application Process**\n"
+            "1️⃣ Select an organization\n"
+            "2️⃣ Private application channel opens\n"
+            "3️⃣ Submit your information\n"
+            "4️⃣ Upload mandatory proof\n"
+            "5️⃣ Master/Admin reviews your application\n"
+            "6️⃣ Approved applications receive the organization role\n\n"
+            "⚠️ **Important:**\n"
+            "You can have only **one organization role at a time**.\n"
+            "When a new organization is approved, your previous "
+            "organization role will be removed automatically."
+        ),
+
         color=discord.Color.blurple()
     )
 
+
     embed.add_field(
-        name="👥 Members",
-        value=str(
-            interaction.guild.member_count
-        ),
+
+        name="🏛️ Government",
+        value="Government Administration",
         inline=True
     )
 
     embed.add_field(
-        name="🟢 Online",
-        value=str(online),
+
+        name="🪖 Military Unit",
+        value="Military Organization",
         inline=True
     )
 
     embed.add_field(
-        name="💤 AFK / Idle",
-        value=str(idle),
+
+        name="🏥 Hospitals",
+        value="ARZAMAS • YUZHNEY",
         inline=True
     )
 
     embed.add_field(
-        name="🔴 DND",
-        value=str(dnd),
+
+        name="🚓 Police",
+        value="Yuzhny PD • Arzamas PD",
         inline=True
     )
 
     embed.add_field(
-        name="📡 Tracking",
-        value="Presence based",
+
+        name="🕵️ FBI",
+        value="Federal Investigation",
+        inline=True
+    )
+
+    embed.add_field(
+
+        name="📰 News Network",
+        value="Media Organization",
+        inline=True
+    )
+
+    embed.add_field(
+
+        name="🏴 OCG",
+        value="Caucasian • Orekhov • Kurgan",
         inline=False
     )
 
-    await interaction.response.send_message(
-        embed=embed
-    )
-
-
-# =========================================================
-# ACTIVITY RESET
-# =========================================================
-
-@bot.tree.command(
-    name="activityreset",
-    description="Reset member activity."
-)
-@app_commands.describe(
-    member="Member"
-)
-async def activityreset(
-    interaction,
-    member: discord.Member
-):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    db.execute(
-        """
-        UPDATE activity
-        SET
-            active_seconds=0,
-            idle_seconds=0,
-            current_status='offline',
-            last_change=?,
-            idle_since=NULL
-        WHERE guild_id=? AND user_id=?
-        """,
-        (
-            iso_time(utc_now()),
-            interaction.guild.id,
-            member.id
-        )
-    )
-
-    db.commit()
-
-    await interaction.response.send_message(
-        f"♻️ Activity reset for {member.mention}."
-    )
-
-
-# =========================================================
-# ANNOUNCEMENT
-# =========================================================
-
-@bot.tree.command(
-    name="announce",
-    description="Send announcement with Citizen mention."
-)
-@app_commands.describe(
-    channel="Announcement channel",
-    title="Announcement title",
-    message="Announcement message"
-)
-async def announce(
-    interaction,
-    channel: discord.TextChannel,
-    title: str,
-    message: str
-):
-
-    if not is_staff(interaction.user):
-
-        return await interaction.response.send_message(
-            "❌ Staff only.",
-            ephemeral=True
-        )
-
-    citizen = interaction.guild.get_role(
-        CITIZEN_ROLE_ID
-    )
-
-    if citizen is None:
-
-        return await interaction.response.send_message(
-            "❌ Citizen role not found.",
-            ephemeral=True
-        )
-
-    embed = discord.Embed(
-        title=f"📢 {title}",
-        description=message,
-        color=discord.Color.blurple(),
-        timestamp=utc_now()
-    )
 
     embed.set_footer(
-        text=f"Posted by {interaction.user.display_name}"
-    )
 
-    allowed_mentions = discord.AllowedMentions(
-        roles=[citizen],
-        users=False,
-        everyone=False,
-        replied_user=False
-    )
-
-    await channel.send(
-        content=citizen.mention,
-        embed=embed,
-        allowed_mentions=allowed_mentions
-    )
-
-    await interaction.response.send_message(
-        f"✅ Announcement sent to {channel.mention}.",
-        ephemeral=True
+        text=(
+            "Modern City RP • Organization Verification System"
+        )
     )
 
 
-# =========================================================
+    return embed
+
+
+# ============================================================
+# SEND / REFRESH ORGANIZATION PANEL
+# ============================================================
+
+async def send_organization_panel():
+
+    channel = bot.get_channel(
+        ORG_PANEL_CHANNEL_ID
+    )
+
+    if not channel:
+
+        return
+
+
+    embed = organization_panel_embed()
+
+
+    try:
+
+        await channel.send(
+
+            embed=embed,
+
+            view=OrganizationPanelView()
+        )
+
+    except discord.HTTPException:
+
+        pass
+
+
+# ============================================================
+# APPLICATION VIEW RESTORE
+# ============================================================
+
+async def restore_pending_application_views():
+
+    rows = db_execute(
+
+        """
+        SELECT channel_id
+
+        FROM applications
+
+        WHERE status='pending'
+        """,
+
+        fetch=True
+    )
+
+
+    for row in rows:
+
+        channel_id = row[
+            "channel_id"
+        ]
+
+        channel = bot.get_channel(
+            channel_id
+        )
+
+        if not channel:
+
+            continue
+
+
+        try:
+
+            bot.add_view(
+                ApplicationReviewView(),
+                message_id=None
+            )
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# END OF PART 2
+# ============================================================
+# ============================================================
+# PART 3
+# MODERATION + ANTI-LINK + ACTIVITY COMMANDS + STARTUP
+# ============================================================
+
+
+# ============================================================
+# ANTI-LINK SYSTEM
+# ============================================================
+
+URL_PATTERN = re.compile(
+    r"""(?ix)
+    (?:
+        https?://[^\s<>()]+
+        |
+        www\.[^\s<>()]+
+        |
+        discord\.gg/[^\s<>()]+
+        |
+        discord(?:app)?\.com/invite/[^\s<>()]+
+        |
+        (?<![@\w.-])
+        (?:[a-z0-9-]+\.)+
+        (?:com|net|org|gg|io|in|co|xyz|me|dev|app|info|biz|site|online|store|tech|pro|live|tv|ly|link)
+        (?:[/?#][^\s<>()]*)?
+    )
+    """
+)
+
+
+async def apply_link_timeout(member):
+
+    try:
+
+        until = discord.utils.utcnow() + timedelta(
+            minutes=10
+        )
+
+        await member.timeout(
+            until,
+            reason="Automatic anti-link protection"
+        )
+
+        return True
+
+    except (
+        discord.Forbidden,
+        discord.HTTPException
+    ):
+
+        return False
+
+
+async def handle_anti_link(message):
+
+    if not message.guild:
+
+        return False
+
+    if message.author.bot:
+
+        return False
+
+    member = message.author
+
+    if not isinstance(
+        member,
+        discord.Member
+    ):
+
+        return False
+
+    # Master/Admin bypass
+    if is_master(member):
+
+        return False
+
+    content = message.content or ""
+
+    if not content.strip():
+
+        return False
+
+    if not URL_PATTERN.search(content):
+
+        return False
+
+    # Delete immediately
+    try:
+
+        await message.delete(
+            reason="Automatic anti-link protection"
+        )
+
+    except discord.HTTPException:
+
+        pass
+
+    # Timeout for 10 minutes
+    timeout_success = await apply_link_timeout(
+        member
+    )
+
+    # Warning message
+    try:
+
+        if timeout_success:
+
+            text = (
+                f"🚫 {member.mention} **link detected and removed.**\n"
+                "You have been timed out for **10 minutes**."
+            )
+
+        else:
+
+            text = (
+                f"🚫 {member.mention} **link detected and removed.**\n"
+                "I could not apply the 10-minute timeout. "
+                "Check the bot's role hierarchy."
+            )
+
+        warning = await message.channel.send(
+            text,
+            allowed_mentions=discord.AllowedMentions(
+                users=True
+            )
+        )
+
+        await asyncio.sleep(5)
+
+        try:
+
+            await warning.delete()
+
+        except discord.HTTPException:
+
+            pass
+
+    except discord.HTTPException:
+
+        pass
+
+    # Log
+    await send_log(
+
+        "🛡️ Anti-Link Protection",
+
+        f"{member.mention} sent a blocked link.",
+
+        discord.Color.red(),
+
+        fields=[
+
+            (
+                "User",
+                f"{member.mention}\n`{member.id}`",
+                True
+            ),
+
+            (
+                "Channel",
+                message.channel.mention,
+                True
+            ),
+
+            (
+                "Timeout",
+                "10 minutes"
+                if timeout_success
+                else "Failed",
+                True
+            ),
+
+            (
+                "Action",
+                "Message deleted",
+                True
+            )
+        ]
+    )
+
+    return True
+
+
+# ============================================================
+# MESSAGE EVENT
+# ============================================================
+
+@bot.event
+async def on_message(message):
+
+    if message.author.bot:
+
+        return
+
+    # Anti-link first
+    blocked = await handle_anti_link(
+        message
+    )
+
+    if blocked:
+
+        return
+
+    # Application proof
+    await handle_application_proof(
+        message
+    )
+
+    # IMPORTANT:
+    # Keep slash/prefix command processing alive.
+    await bot.process_commands(
+        message
+    )
+
+
+# ============================================================
+# PRESENCE TRACKING
+# ============================================================
+
+@bot.event
+async def on_presence_update(
+    before,
+    after
+):
+
+    try:
+
+        await process_presence(
+            after,
+            before.status,
+            after.status
+        )
+
+    except Exception:
+
+        pass
+
+
+# ============================================================
 # PING
-# =========================================================
+# ============================================================
 
 @bot.tree.command(
     name="ping",
-    description="Check bot latency."
+    description="Check bot latency"
 )
-async def ping(interaction):
+async def ping(
+    interaction: discord.Interaction
+):
 
     latency = round(
         bot.latency * 1000
     )
 
     await interaction.response.send_message(
-        f"🏓 Pong! `{latency}ms`"
+
+        f"🏓 **Pong!**\n"
+        f"Latency: `{latency}ms`"
     )
 
 
-# =========================================================
+# ============================================================
 # BOT INFO
-# =========================================================
+# ============================================================
 
 @bot.tree.command(
     name="botinfo",
-    description="Show bot information."
+    description="Show bot information"
 )
-async def botinfo(interaction):
+async def botinfo(
+    interaction: discord.Interaction
+):
 
     embed = discord.Embed(
-        title="🤖 Modern City Bot",
+
+        title="🤖 Modern City RP Bot",
+
         description=(
-            "Modern City RP security, "
-            "moderation and management bot."
+            "Modern City RP management and verification bot."
         ),
+
         color=discord.Color.blurple()
     )
 
     embed.add_field(
-        name="🛡️ Security",
-        value="Advanced Anti-Link",
+        name="⚙️ Features",
+        value=(
+            "• Organization verification\n"
+            "• Anti-link protection\n"
+            "• Moderation\n"
+            "• Member activity\n"
+            "• Staff tools\n"
+            "• Server utilities"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📦 Library",
+        value="discord.py",
         inline=True
     )
 
     embed.add_field(
-        name="📊 Activity",
-        value="Presence + AFK",
-        inline=True
-    )
-
-    embed.add_field(
-        name="📢 Announcements",
-        value="Citizen Auto Mention",
-        inline=True
-    )
-
-    embed.add_field(
-        name="💾 Database",
+        name="🗄️ Database",
         value="SQLite",
         inline=True
     )
 
-    embed.add_field(
-        name="🎙️ Recording",
-        value="Disabled",
-        inline=True
+    embed.set_footer(
+        text="Modern City RP"
     )
 
     await interaction.response.send_message(
@@ -1596,20 +2320,28 @@ async def botinfo(interaction):
     )
 
 
-# =========================================================
+# ============================================================
 # SERVER INFO
-# =========================================================
+# ============================================================
 
 @bot.tree.command(
     name="serverinfo",
-    description="Show server information."
+    description="Show server information"
 )
-async def serverinfo(interaction):
+async def serverinfo(
+    interaction: discord.Interaction
+):
 
     guild = interaction.guild
 
+    if not guild:
+
+        return
+
     embed = discord.Embed(
+
         title=f"🏙️ {guild.name}",
+
         color=discord.Color.blurple()
     )
 
@@ -1632,11 +2364,8 @@ async def serverinfo(interaction):
     )
 
     embed.add_field(
-        name="📅 Created",
-        value=discord.utils.format_dt(
-            guild.created_at,
-            "D"
-        ),
+        name="🆔 Server ID",
+        value=f"`{guild.id}`",
         inline=False
     )
 
@@ -1645,15 +2374,1742 @@ async def serverinfo(interaction):
     )
 
 
-# =========================================================
-# START BOT
-# =========================================================
+# ============================================================
+# STAFF CHECK
+# ============================================================
 
-if not TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN GitHub Secret is missing."
+def staff_only():
+
+    async def predicate(
+        interaction: discord.Interaction
+    ):
+
+        if not interaction.guild:
+
+            return False
+
+        return is_staff(
+            interaction.user
+        )
+
+    return app_commands.check(
+        predicate
     )
 
-init_database()
 
-bot.run(TOKEN)
+# ============================================================
+# ANNOUNCE
+# ============================================================
+
+@bot.tree.command(
+    name="announce",
+    description="Send a staff announcement"
+)
+@staff_only()
+@app_commands.describe(
+    channel="Channel where the announcement will be sent",
+    title="Announcement title",
+    message="Announcement message"
+)
+async def announce(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    title: str,
+    message: str
+):
+
+    citizen_role = get_role(
+        interaction.guild,
+        CITIZEN_ROLE_ID
+    )
+
+    if not citizen_role:
+
+        await interaction.response.send_message(
+            "❌ Citizen role was not found.",
+            ephemeral=True
+        )
+
+        return
+
+    embed = discord.Embed(
+
+        title=title,
+
+        description=message,
+
+        color=discord.Color.blurple(),
+
+        timestamp=utc_now()
+    )
+
+    embed.set_footer(
+        text=f"Announcement by {interaction.user}"
+    )
+
+    try:
+
+        await channel.send(
+
+            content=citizen_role.mention,
+
+            embed=embed,
+
+            allowed_mentions=discord.AllowedMentions(
+                roles=True
+            )
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ I cannot send messages in that channel.",
+            ephemeral=True
+        )
+
+        return
+
+    except discord.HTTPException:
+
+        await interaction.response.send_message(
+            "❌ Failed to send announcement.",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.send_message(
+
+        f"✅ Announcement sent to {channel.mention}.",
+
+        ephemeral=True
+    )
+
+    await send_log(
+
+        "📢 Announcement Sent",
+
+        f"{interaction.user.mention} sent an announcement.",
+
+        discord.Color.blurple(),
+
+        fields=[
+
+            (
+                "Channel",
+                channel.mention,
+                True
+            ),
+
+            (
+                "Title",
+                title[:100],
+                True
+            )
+        ]
+    )
+
+
+# ============================================================
+# WARNINGS DATABASE
+# ============================================================
+
+db_execute("""
+    CREATE TABLE IF NOT EXISTS warnings (
+
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        guild_id INTEGER NOT NULL,
+
+        user_id INTEGER NOT NULL,
+
+        moderator_id INTEGER NOT NULL,
+
+        reason TEXT NOT NULL,
+
+        created_at INTEGER NOT NULL
+    )
+""")
+
+
+# ============================================================
+# WARN
+# ============================================================
+
+@bot.tree.command(
+    name="warn",
+    description="Warn a member"
+)
+@staff_only()
+@app_commands.describe(
+    member="Member to warn",
+    reason="Reason for warning"
+)
+async def warn(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str
+):
+
+    if member.bot:
+
+        await interaction.response.send_message(
+            "❌ Bots cannot be warned.",
+            ephemeral=True
+        )
+
+        return
+
+    db_execute(
+
+        """
+        INSERT INTO warnings
+        (
+            guild_id,
+            user_id,
+            moderator_id,
+            reason,
+            created_at
+        )
+
+        VALUES
+        (
+            ?,
+            ?,
+            ?,
+            ?,
+            ?
+        )
+        """,
+
+        (
+            interaction.guild.id,
+            member.id,
+            interaction.user.id,
+            reason,
+            now_ts()
+        )
+    )
+
+    rows = db_execute(
+
+        """
+        SELECT COUNT(*) AS total
+
+        FROM warnings
+
+        WHERE guild_id=?
+        AND user_id=?
+        """,
+
+        (
+            interaction.guild.id,
+            member.id
+        ),
+
+        fetch=True
+    )
+
+    total = rows[0]["total"]
+
+    await interaction.response.send_message(
+
+        f"⚠️ {member.mention} has been warned.\n"
+        f"Reason: **{reason}**\n"
+        f"Total warnings: `{total}`"
+    )
+
+    await send_log(
+
+        "⚠️ Member Warned",
+
+        f"{member.mention} received a warning.",
+
+        discord.Color.orange(),
+
+        fields=[
+
+            (
+                "Member",
+                f"{member.mention}\n`{member.id}`",
+                True
+            ),
+
+            (
+                "Moderator",
+                f"{interaction.user.mention}\n`{interaction.user.id}`",
+                True
+            ),
+
+            (
+                "Reason",
+                reason,
+                False
+            ),
+
+            (
+                "Total Warnings",
+                str(total),
+                True
+            )
+        ]
+    )
+
+
+# ============================================================
+# WARNINGS
+# ============================================================
+
+@bot.tree.command(
+    name="warnings",
+    description="View member warnings"
+)
+@staff_only()
+@app_commands.describe(
+    member="Member whose warnings you want to view"
+)
+async def warnings(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    rows = db_execute(
+
+        """
+        SELECT *
+
+        FROM warnings
+
+        WHERE guild_id=?
+        AND user_id=?
+
+        ORDER BY created_at DESC
+        """,
+
+        (
+            interaction.guild.id,
+            member.id
+        ),
+
+        fetch=True
+    )
+
+    if not rows:
+
+        await interaction.response.send_message(
+
+            f"✅ {member.mention} has no warnings.",
+
+            ephemeral=True
+        )
+
+        return
+
+
+    lines = []
+
+    for row in rows[:20]:
+
+        lines.append(
+
+            f"**#{row['id']}** • "
+            f"<@{row['moderator_id']}> • "
+            f"{timestamp_text(row['created_at'])}\n"
+            f"└ {row['reason']}"
+        )
+
+
+    embed = discord.Embed(
+
+        title=f"⚠️ Warnings • {member}",
+
+        description="\n\n".join(lines),
+
+        color=discord.Color.orange()
+    )
+
+    embed.set_footer(
+        text=f"Total warnings: {len(rows)}"
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+# ============================================================
+# CLEAR WARNINGS
+# ============================================================
+
+@bot.tree.command(
+    name="clearwarnings",
+    description="Clear all warnings for a member"
+)
+@staff_only()
+@app_commands.describe(
+    member="Member whose warnings should be cleared"
+)
+async def clearwarnings(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    db_execute(
+
+        """
+        DELETE FROM warnings
+
+        WHERE guild_id=?
+        AND user_id=?
+        """,
+
+        (
+            interaction.guild.id,
+            member.id
+        )
+    )
+
+    await interaction.response.send_message(
+
+        f"🧹 Cleared all warnings for {member.mention}.",
+
+        ephemeral=True
+    )
+
+    await send_log(
+
+        "🧹 Warnings Cleared",
+
+        f"All warnings for {member.mention} were cleared.",
+
+        discord.Color.green(),
+
+        fields=[
+
+            (
+                "Member",
+                f"{member.mention}\n`{member.id}`",
+                True
+            ),
+
+            (
+                "Moderator",
+                f"{interaction.user.mention}\n`{interaction.user.id}`",
+                True
+            )
+        ]
+    )
+
+
+# ============================================================
+# KICK
+# ============================================================
+
+@bot.tree.command(
+    name="kick",
+    description="Kick a member"
+)
+@staff_only()
+@app_commands.describe(
+    member="Member to kick",
+    reason="Reason"
+)
+async def kick(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided"
+):
+
+    if member == interaction.user:
+
+        await interaction.response.send_message(
+            "❌ You cannot kick yourself.",
+            ephemeral=True
+        )
+
+        return
+
+    try:
+
+        await member.kick(
+            reason=reason
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ I cannot kick this member.",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.send_message(
+
+        f"👢 {member.mention} was kicked.\n"
+        f"Reason: **{reason}**"
+    )
+
+    await send_log(
+
+        "👢 Member Kicked",
+
+        f"{member} was kicked.",
+
+        discord.Color.red(),
+
+        fields=[
+
+            (
+                "Member",
+                f"{member}\n`{member.id}`",
+                True
+            ),
+
+            (
+                "Moderator",
+                f"{interaction.user.mention}\n`{interaction.user.id}`",
+                True
+            ),
+
+            (
+                "Reason",
+                reason,
+                False
+            )
+        ]
+    )
+
+
+# ============================================================
+# BAN
+# ============================================================
+
+@bot.tree.command(
+    name="ban",
+    description="Ban a member"
+)
+@staff_only()
+@app_commands.describe(
+    member="Member to ban",
+    reason="Reason"
+)
+async def ban(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = "No reason provided"
+):
+
+    if member == interaction.user:
+
+        await interaction.response.send_message(
+            "❌ You cannot ban yourself.",
+            ephemeral=True
+        )
+
+        return
+
+    try:
+
+        await member.ban(
+            reason=reason,
+            delete_message_days=1
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ I cannot ban this member.",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.send_message(
+
+        f"🔨 {member.mention} was banned.\n"
+        f"Reason: **{reason}**"
+    )
+
+    await send_log(
+
+        "🔨 Member Banned",
+
+        f"{member} was banned.",
+
+        discord.Color.red(),
+
+        fields=[
+
+            (
+                "Member",
+                f"{member}\n`{member.id}`",
+                True
+            ),
+
+            (
+                "Moderator",
+                f"{interaction.user.mention}\n`{interaction.user.id}`",
+                True
+            ),
+
+            (
+                "Reason",
+                reason,
+                False
+            )
+        ]
+    )
+
+
+# ============================================================
+# TIMEOUT
+# ============================================================
+
+@bot.tree.command(
+    name="timeout",
+    description="Timeout a member"
+)
+@staff_only()
+@app_commands.describe(
+    member="Member to timeout",
+    minutes="Timeout duration in minutes",
+    reason="Reason"
+)
+async def timeout_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: int,
+    reason: str = "No reason provided"
+):
+
+    if minutes < 1:
+
+        await interaction.response.send_message(
+            "❌ Minimum timeout is 1 minute.",
+            ephemeral=True
+        )
+
+        return
+
+    if minutes > 40320:
+
+        await interaction.response.send_message(
+            "❌ Maximum timeout is 28 days.",
+            ephemeral=True
+        )
+
+        return
+
+    try:
+
+        await member.timeout(
+
+            discord.utils.utcnow()
+            + timedelta(minutes=minutes),
+
+            reason=reason
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ I cannot timeout this member.",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.send_message(
+
+        f"⏱️ {member.mention} timed out for "
+        f"**{minutes} minutes**.\n"
+        f"Reason: **{reason}**"
+    )
+
+
+# ============================================================
+# CLEAR MESSAGES
+# ============================================================
+
+@bot.tree.command(
+    name="clear",
+    description="Delete messages"
+)
+@staff_only()
+@app_commands.describe(
+    amount="Number of messages to delete"
+)
+async def clear(
+    interaction: discord.Interaction,
+    amount: int
+):
+
+    if amount < 1 or amount > 100:
+
+        await interaction.response.send_message(
+            "❌ Amount must be between 1 and 100.",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    deleted = await interaction.channel.purge(
+        limit=amount
+    )
+
+    await interaction.followup.send(
+
+        f"🧹 Deleted `{len(deleted)}` messages.",
+
+        ephemeral=True
+    )
+
+
+# ============================================================
+# ACTIVITY EMBED
+# ============================================================
+
+def activity_status_emoji(status):
+
+    return {
+
+        "online": "🟢",
+
+        "idle": "🌙",
+
+        "dnd": "🔴",
+
+        "offline": "⚫"
+
+    }.get(
+        status,
+        "⚫"
+    )
+
+
+def activity_embed(
+    member,
+    data
+):
+
+    status = data[
+        "current_status"
+    ]
+
+    embed = discord.Embed(
+
+        title=f"📊 Activity • {member.display_name}",
+
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+
+        name="Status",
+
+        value=(
+            f"{activity_status_emoji(status)} "
+            f"`{status.upper()}`"
+        ),
+
+        inline=True
+    )
+
+    embed.add_field(
+
+        name="Sessions",
+
+        value=str(
+            data["session_count"]
+        ),
+
+        inline=True
+    )
+
+    embed.add_field(
+
+        name="Total Tracked",
+
+        value=format_duration(
+            data["total_seconds"]
+        ),
+
+        inline=True
+    )
+
+    embed.add_field(
+
+        name="🟢 Online",
+
+        value=format_duration(
+            data["online_seconds"]
+        ),
+
+        inline=True
+    )
+
+    embed.add_field(
+
+        name="🌙 Idle",
+
+        value=format_duration(
+            data["idle_seconds"]
+        ),
+
+        inline=True
+    )
+
+    embed.add_field(
+
+        name="🔴 DND",
+
+        value=format_duration(
+            data["dnd_seconds"]
+        ),
+
+        inline=True
+    )
+
+    embed.add_field(
+
+        name="First Tracked",
+
+        value=timestamp_text(
+            data["first_tracked"]
+        ),
+
+        inline=False
+    )
+
+    embed.add_field(
+
+        name="Last Seen",
+
+        value=timestamp_text(
+            data["last_seen"]
+        ),
+
+        inline=False
+    )
+
+    embed.set_thumbnail(
+        url=member.display_avatar.url
+    )
+
+    return embed
+
+
+# ============================================================
+# /ACTIVITY
+# ============================================================
+
+@bot.tree.command(
+    name="activity",
+    description="View member activity"
+)
+@app_commands.describe(
+    member="Member to check"
+)
+async def activity(
+    interaction: discord.Interaction,
+    member: discord.Member = None
+):
+
+    target = member or interaction.user
+
+    data = get_activity_data(
+        target.id
+    )
+
+    if not data:
+
+        ensure_activity_member(
+            target
+        )
+
+        data = get_activity_data(
+            target.id
+        )
+
+    await interaction.response.send_message(
+
+        embed=activity_embed(
+            target,
+            data
+        ),
+
+        ephemeral=(
+            member is not None
+            and not is_staff(interaction.user)
+        )
+    )
+
+
+# ============================================================
+# /ACTIVITYDATA
+# ============================================================
+
+@bot.tree.command(
+    name="activitydata",
+    description="View raw activity data"
+)
+@staff_only()
+@app_commands.describe(
+    member="Member"
+)
+async def activitydata(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    data = get_activity_data(
+        member.id
+    )
+
+    if not data:
+
+        await interaction.response.send_message(
+            "❌ No activity data found.",
+            ephemeral=True
+        )
+
+        return
+
+    current_session = max(
+        0,
+        now_ts() -
+        data["status_started"]
+    )
+
+    embed = discord.Embed(
+
+        title=f"🧾 Raw Activity Data • {member}",
+
+        color=discord.Color.dark_blue()
+    )
+
+    embed.add_field(
+        name="User ID",
+        value=f"`{member.id}`",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Current Status",
+        value=data["current_status"],
+        inline=True
+    )
+
+    embed.add_field(
+        name="Current Session",
+        value=format_duration(
+            current_session
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Sessions",
+        value=str(
+            data["session_count"]
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Online",
+        value=format_duration(
+            data["online_seconds"]
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Idle",
+        value=format_duration(
+            data["idle_seconds"]
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="DND",
+        value=format_duration(
+            data["dnd_seconds"]
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Total",
+        value=format_duration(
+            data["total_seconds"]
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="First Tracked",
+        value=timestamp_text(
+            data["first_tracked"]
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Last Seen",
+        value=timestamp_text(
+            data["last_seen"]
+        ),
+        inline=False
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+# ============================================================
+# /ACTIVITYBOARD
+# ============================================================
+
+@bot.tree.command(
+    name="activityboard",
+    description="Show top activity members"
+)
+async def activityboard(
+    interaction: discord.Interaction
+):
+
+    rows = db_execute(
+
+        """
+        SELECT *
+
+        FROM activity
+
+        ORDER BY
+            (
+                online_seconds
+                +
+                idle_seconds
+                +
+                dnd_seconds
+            ) DESC
+
+        LIMIT 10
+        """,
+
+        fetch=True
+    )
+
+    if not rows:
+
+        await interaction.response.send_message(
+            "📊 No activity data available yet."
+        )
+
+        return
+
+    lines = []
+
+    for index, row in enumerate(
+        rows,
+        start=1
+    ):
+
+        member = interaction.guild.get_member(
+            row["user_id"]
+        )
+
+        if not member:
+
+            continue
+
+        total = (
+            row["online_seconds"]
+            +
+            row["idle_seconds"]
+            +
+            row["dnd_seconds"]
+        )
+
+        lines.append(
+
+            f"**{index}.** {member.mention} "
+            f"• `{format_duration(total)}`"
+        )
+
+
+    embed = discord.Embed(
+
+        title="🏆 Activity Board",
+
+        description="\n".join(lines)
+        if lines
+        else "No members found.",
+
+        color=discord.Color.gold()
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# ============================================================
+# /SERVERACTIVITY
+# ============================================================
+
+@bot.tree.command(
+    name="serveractivity",
+    description="Show server activity"
+)
+async def serveractivity(
+    interaction: discord.Interaction
+):
+
+    rows = db_execute(
+
+        """
+        SELECT current_status, COUNT(*) AS total
+
+        FROM activity
+
+        GROUP BY current_status
+        """,
+
+        fetch=True
+    )
+
+    counts = {
+        "online": 0,
+        "idle": 0,
+        "dnd": 0,
+        "offline": 0
+    }
+
+    for row in rows:
+
+        counts[
+            row["current_status"]
+        ] = row["total"]
+
+
+    total_tracked = sum(
+        counts.values()
+    )
+
+    embed = discord.Embed(
+
+        title="📊 Server Activity",
+
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="🟢 Online",
+        value=str(counts["online"]),
+        inline=True
+    )
+
+    embed.add_field(
+        name="🌙 Idle",
+        value=str(counts["idle"]),
+        inline=True
+    )
+
+    embed.add_field(
+        name="🔴 DND",
+        value=str(counts["dnd"]),
+        inline=True
+    )
+
+    embed.add_field(
+        name="⚫ Offline",
+        value=str(counts["offline"]),
+        inline=True
+    )
+
+    embed.add_field(
+        name="👥 Total Tracked",
+        value=str(total_tracked),
+        inline=True
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# ============================================================
+# /ACTIVITYTODAY
+# ============================================================
+
+@bot.tree.command(
+    name="activitytoday",
+    description="Show today's activity"
+)
+async def activitytoday(
+    interaction: discord.Interaction
+):
+
+    today = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d"
+    )
+
+    rows = db_execute(
+
+        """
+        SELECT
+            user_id,
+            online_seconds,
+            idle_seconds,
+            dnd_seconds
+
+        FROM activity_daily
+
+        WHERE day=?
+
+        ORDER BY
+            (
+                online_seconds
+                +
+                idle_seconds
+                +
+                dnd_seconds
+            ) DESC
+
+        LIMIT 10
+        """,
+
+        (
+            today,
+        ),
+
+        fetch=True
+    )
+
+    if not rows:
+
+        await interaction.response.send_message(
+            "📊 No activity recorded today."
+        )
+
+        return
+
+
+    lines = []
+
+    for index, row in enumerate(
+        rows,
+        start=1
+    ):
+
+        member = interaction.guild.get_member(
+            row["user_id"]
+        )
+
+        if not member:
+
+            continue
+
+        total = (
+            row["online_seconds"]
+            +
+            row["idle_seconds"]
+            +
+            row["dnd_seconds"]
+        )
+
+        lines.append(
+
+            f"**{index}.** {member.mention} "
+            f"• `{format_duration(total)}`"
+        )
+
+
+    embed = discord.Embed(
+
+        title="📅 Today's Activity",
+
+        description="\n".join(lines)
+        if lines
+        else "No members found.",
+
+        color=discord.Color.green()
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# ============================================================
+# /ACTIVITYWEEK
+# ============================================================
+
+@bot.tree.command(
+    name="activityweek",
+    description="Show activity for the last 7 days"
+)
+async def activityweek(
+    interaction: discord.Interaction
+):
+
+    rows = db_execute(
+
+        """
+        SELECT
+            user_id,
+            SUM(online_seconds) AS online,
+            SUM(idle_seconds) AS idle,
+            SUM(dnd_seconds) AS dnd
+
+        FROM activity_daily
+
+        GROUP BY user_id
+
+        ORDER BY
+            (
+                SUM(online_seconds)
+                +
+                SUM(idle_seconds)
+                +
+                SUM(dnd_seconds)
+            ) DESC
+
+        LIMIT 10
+        """,
+
+        fetch=True
+    )
+
+    if not rows:
+
+        await interaction.response.send_message(
+            "📊 No weekly activity data yet."
+        )
+
+        return
+
+
+    lines = []
+
+    for index, row in enumerate(
+        rows,
+        start=1
+    ):
+
+        member = interaction.guild.get_member(
+            row["user_id"]
+        )
+
+        if not member:
+
+            continue
+
+        total = (
+            row["online"]
+            +
+            row["idle"]
+            +
+            row["dnd"]
+        )
+
+        lines.append(
+
+            f"**{index}.** {member.mention} "
+            f"• `{format_duration(total)}`"
+        )
+
+
+    embed = discord.Embed(
+
+        title="📆 Weekly Activity",
+
+        description="\n".join(lines)
+        if lines
+        else "No members found.",
+
+        color=discord.Color.blue()
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# ============================================================
+# /AFKLIST
+# ============================================================
+
+@bot.tree.command(
+    name="afklist",
+    description="Show currently idle members"
+)
+async def afklist(
+    interaction: discord.Interaction
+):
+
+    rows = db_execute(
+
+        """
+        SELECT
+            user_id,
+            status_started
+
+        FROM activity
+
+        WHERE current_status='idle'
+
+        ORDER BY status_started ASC
+        """,
+
+        fetch=True
+    )
+
+    if not rows:
+
+        await interaction.response.send_message(
+            "🌙 No members are currently idle."
+        )
+
+        return
+
+
+    lines = []
+
+    for row in rows:
+
+        member = interaction.guild.get_member(
+            row["user_id"]
+        )
+
+        if not member:
+
+            continue
+
+        duration = max(
+            0,
+            now_ts() -
+            row["status_started"]
+        )
+
+        lines.append(
+
+            f"🌙 {member.mention} "
+            f"• `{format_duration(duration)}`"
+        )
+
+
+    embed = discord.Embed(
+
+        title="🌙 Currently Idle",
+
+        description="\n".join(lines)
+        if lines
+        else "No members found.",
+
+        color=discord.Color.orange()
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# ============================================================
+# /ACTIVITYRESET
+# ============================================================
+
+@bot.tree.command(
+    name="activityreset",
+    description="Reset member activity"
+)
+@staff_only()
+@app_commands.describe(
+    member="Member whose activity should be reset"
+)
+async def activityreset(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    timestamp = now_ts()
+
+    db_execute(
+
+        """
+        UPDATE activity
+
+        SET
+            online_seconds=0,
+            idle_seconds=0,
+            dnd_seconds=0,
+            session_count=0,
+            first_tracked=?,
+            last_seen=?,
+            status_started=?
+
+        WHERE user_id=?
+        """,
+
+        (
+            timestamp,
+            timestamp,
+            timestamp,
+            member.id
+        )
+    )
+
+    db_execute(
+
+        """
+        DELETE FROM activity_daily
+
+        WHERE user_id=?
+        """,
+
+        (
+            member.id,
+        )
+    )
+
+    await interaction.response.send_message(
+
+        f"♻️ Activity data reset for {member.mention}.",
+
+        ephemeral=True
+    )
+
+    await send_log(
+
+        "♻️ Activity Reset",
+
+        f"Activity data reset for {member.mention}.",
+
+        discord.Color.orange(),
+
+        fields=[
+
+            (
+                "Member",
+                f"{member.mention}\n`{member.id}`",
+                True
+            ),
+
+            (
+                "Staff",
+                f"{interaction.user.mention}\n`{interaction.user.id}`",
+                True
+            )
+        ]
+    )
+
+
+# ============================================================
+# ORG PANEL COMMAND
+# ============================================================
+
+@bot.tree.command(
+    name="orgpanel",
+    description="Send the organization panel"
+)
+@staff_only()
+async def orgpanel(
+    interaction: discord.Interaction
+):
+
+    channel = bot.get_channel(
+        ORG_PANEL_CHANNEL_ID
+    )
+
+    if not channel:
+
+        await interaction.response.send_message(
+            "❌ Organization panel channel not found.",
+            ephemeral=True
+        )
+
+        return
+
+    await channel.send(
+
+        embed=organization_panel_embed(),
+
+        view=OrganizationPanelView()
+    )
+
+    await interaction.response.send_message(
+
+        f"✅ Organization panel sent to {channel.mention}.",
+
+        ephemeral=True
+    )
+
+
+# ============================================================
+# READY EVENT
+# ============================================================
+
+@bot.event
+async def on_ready():
+
+    print(
+        f"Logged in as {bot.user} "
+        f"({bot.user.id})"
+    )
+
+    guild = bot.get_guild(
+        GUILD_ID
+    )
+
+    if guild:
+
+        # ----------------------------------------------
+        # INITIALIZE ACTIVITY DATA
+        # ----------------------------------------------
+
+        for member in guild.members:
+
+            try:
+
+                ensure_activity_member(
+                    member
+                )
+
+            except Exception:
+
+                pass
+
+
+    # ----------------------------------------------
+    # REGISTER PERSISTENT ORGANIZATION PANEL
+    # ----------------------------------------------
+
+    try:
+
+        bot.add_view(
+            OrganizationPanelView()
+        )
+
+    except Exception:
+
+        pass
+
+
+    # ----------------------------------------------
+    # REGISTER APPLICATION REVIEW VIEW
+    # ----------------------------------------------
+
+    try:
+
+        bot.add_view(
+            ApplicationReviewView()
+        )
+
+    except Exception:
+
+        pass
+
+
+    # ----------------------------------------------
+    # ACTIVITY LOOP
+    # ----------------------------------------------
+
+    if not activity_flush.is_running():
+
+        activity_flush.start()
+
+
+    # ----------------------------------------------
+    # SYNC COMMANDS
+    # ----------------------------------------------
+
+    try:
+
+        guild_object = discord.Object(
+            id=GUILD_ID
+        )
+
+        synced = await bot.tree.sync(
+            guild=guild_object
+        )
+
+        print(
+            f"Synced {len(synced)} slash commands."
+        )
+
+    except Exception as error:
+
+        print(
+            f"Command sync error: {error}"
+        )
+
+
+    print(
+        "Modern City RP Bot is ONLINE."
+    )
+
+
+# ============================================================
+# COMMAND ERROR HANDLER
+# ============================================================
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction,
+    error
+):
+
+    if isinstance(
+        error,
+        app_commands.CheckFailure
+    ):
+
+        await safe_ephemeral(
+
+            interaction,
+
+            "❌ You do not have permission to use this command."
+        )
+
+        return
+
+
+    print(
+        f"Command error: {error}"
+    )
+
+    await safe_ephemeral(
+
+        interaction,
+
+        "❌ An unexpected error occurred while executing this command."
+    )
+
+
+# ============================================================
+# START BOT
+# ============================================================
+
+if not TOKEN:
+
+    raise RuntimeError(
+        "BOT_TOKEN environment variable is missing."
+    )
+
+
+bot.run(
+    TOKEN
+)
