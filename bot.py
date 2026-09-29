@@ -515,24 +515,11 @@ class ModernCityBot(commands.Bot):
             ApplicationReviewView()
         )
 
+        # Guild slash commands
         guild = discord.Object(
             id=GUILD_ID
         )
 
-        # Remove old global slash commands
-        try:
-            self.tree.clear_commands(guild=None)
-
-            await self.tree.sync()
-
-            print("Old global slash commands cleared.")
-
-        except Exception as error:
-            print(
-                f"Global command cleanup failed: {error}"
-            )
-
-        # Copy current commands to the Modern City server
         self.tree.copy_global_to(
             guild=guild
         )
@@ -544,13 +531,13 @@ class ModernCityBot(commands.Bot):
             )
 
             print(
-                f"Synced {len(synced)} server commands."
+                f"Synced {len(synced)} slash commands."
             )
 
         except Exception as error:
 
             print(
-                f"Server command sync failed: {error}"
+                f"Slash command sync failed: {error}"
             )
 
 
